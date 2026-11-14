@@ -13,6 +13,25 @@ XIAO ESP32-S3 + Grove Shield for XIAO向けのAtomVM/Elixirファームウェア
 
 モーター電源はGrove Shieldから取らず、L298Nへ別電源を接続します。
 
+## 3つのPJの関係
+
+このPJは、XIAO ESP32-S3上で動作する車体側のAtomVM/Elixirファームウェアです。
+
+- [`rc-world`](https://github.com/ymn-t-yamanashi/rc-world)：XRift内の運転席とWASD・カーソル操作を提供します。
+- [`ws-server`](https://github.com/ymn-t-yamanashi/rc-ws-server)：PC上でXRiftとAtomVMのWebSocketを中継します。
+- [`atomvm-rc-car`](https://github.com/ymn-t-yamanashi/atomvm-rc-car)（このPJ）：WSで受信した`motor_set`をGPIOへ反映します。
+
+通信経路は次のとおりです。
+
+```text
+XRift rc-world ⇄ WebSocket /ws ⇄ PC上のws-server ⇄ WebSocket ⇄ XIAO AtomVM
+                                                                        ↓
+                                                             GPIO → L298N → 左右モーター
+```
+
+`motor_set`の`left`と`right`は、`-1`（後退）、`0`（停止）、`1`（前進）です。
+通常は、WSサーバーを起動してからAtomVMを起動し、最後にXRiftワールドへ接続します。
+
 ## セットアップ
 
 ```bash
