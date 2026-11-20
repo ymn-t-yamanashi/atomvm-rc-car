@@ -4,8 +4,6 @@ defmodule RcCarAtomvm.Provisioner do
   @nvs_namespace :atomvm
   @ssid_key :sta_ssid
   @psk_key :sta_psk
-  @server_namespace :rc_car
-  @server_host_key :server_host
   @console_name "USB_SERIAL_JTAG"
 
   @spec reconfigure_requested?() :: boolean()
@@ -42,27 +40,14 @@ defmodule RcCarAtomvm.Provisioner do
   defp configure(uart) do
     with {:ok, ssid} <- read_line(uart, "Wi-Fi SSID"),
          {:ok, psk} <- read_line(uart, "Wi-Fi password"),
-         {:ok, server_host} <- read_server_host(uart),
          :ok <- :esp.nvs_put_binary(@nvs_namespace, @ssid_key, ssid),
-         :ok <- :esp.nvs_put_binary(@nvs_namespace, @psk_key, psk),
-         :ok <- :esp.nvs_put_binary(@server_namespace, @server_host_key, server_host) do
+         :ok <- :esp.nvs_put_binary(@nvs_namespace, @psk_key, psk) do
       write(uart, "Wi-Fi and WebSocket settings saved to NVS.\r\n")
       :ok
     else
       {:error, reason} = error ->
         write(uart, "Wi-Fi setup failed: #{inspect(reason)}\r\n")
         error
-    end
-  end
-
-  defp read_server_host(uart) do
-    with {:ok, value} <- read_line(uart, "WS server IPv4 address (this PC)"),
-         {:ok, _address} <- :inet.parse_address(:erlang.binary_to_list(value)) do
-      {:ok, value}
-    else
-      {:error, :einval} -> {:error, :invalid_server_host}
-      {:error, _reason} = error -> error
-      _ -> {:error, :invalid_server_host}
     end
   end
 
@@ -77,69 +62,58 @@ defmodule RcCarAtomvm.Provisioner do
   end
 
   defp collect_line(uart, buffer, label, timeout) do
-    case line_end(buffer) do
-      {:ok, position} ->
-        value =
-          buffer
-          |> :erlang.binary_part(0, position)
-          |> remove_line_ending()
+    case :uart.read(uart, 1_000) do
+      {:ok, data} ->
+        case consume_input(uart, :erlang.iolist_to_binary(data), buffer, label) do
+          {:line, value} -> finish_line(value, label)
+          {:more, new_buffer} -> collect_line(uart, new_buffer, label, timeout)
+        end
 
-        if value == <<>> do
-          {:error, {:empty_value, label}}
+      {:error, :timeout} ->
+        if timeout == :wait do
+          collect_line(uart, buffer, label, timeout)
         else
-          {:ok, value}
+          {:error, :timeout}
         end
 
-      :nomatch ->
-        case :uart.read(uart, 1_000) do
-          {:ok, data} ->
-            collect_line(
-              uart,
-              <<buffer::binary, :erlang.iolist_to_binary(data)::binary>>,
-              label,
-              timeout
-            )
-
-          {:error, :timeout} ->
-            if timeout == :wait do
-              collect_line(uart, buffer, label, timeout)
-            else
-              {:error, :timeout}
-            end
-
-          {:error, reason} ->
-            {:error, reason}
-        end
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
-  defp line_end(buffer) do
-    case :binary.match(buffer, "\n") do
-      {position, _length} ->
-        {:ok, position}
+  defp consume_input(_uart, <<>>, buffer, _label), do: {:more, buffer}
 
-      :nomatch ->
-        case :binary.match(buffer, "\r") do
-          {position, _length} -> {:ok, position}
-          :nomatch -> :nomatch
-        end
-    end
+  defp consume_input(_uart, <<byte, _rest::binary>>, buffer, _label)
+       when byte in [10, 13],
+       do: {:line, buffer}
+
+  defp consume_input(uart, <<byte, rest::binary>>, <<>>, label) when byte in [8, 127] do
+    consume_input(uart, rest, <<>>, label)
   end
+
+  defp consume_input(uart, <<byte, rest::binary>>, buffer, label) when byte in [8, 127] do
+    new_buffer = :erlang.binary_part(buffer, 0, byte_size(buffer) - 1)
+
+    if echo_input?(label) do
+      :uart.write(uart, <<8, 32, 8>>)
+    end
+
+    consume_input(uart, rest, new_buffer, label)
+  end
+
+  defp consume_input(uart, <<byte, rest::binary>>, buffer, label) do
+    if echo_input?(label) do
+      :uart.write(uart, <<byte>>)
+    end
+
+    consume_input(uart, rest, <<buffer::binary, byte>>, label)
+  end
+
+  defp finish_line(<<>>, label), do: {:error, {:empty_value, label}}
+  defp finish_line(value, _label), do: {:ok, value}
+
+  defp echo_input?("Wi-Fi password"), do: false
+  defp echo_input?(_label), do: true
 
   defp write(uart, data), do: :uart.write(uart, data)
-
-  defp remove_line_ending(<<>>), do: <<>>
-
-  defp remove_line_ending(value) do
-    length = byte_size(value)
-    last_byte = :erlang.binary_part(value, length - 1, 1)
-
-    if last_byte == "\n" or last_byte == "\r" do
-      value
-      |> :erlang.binary_part(0, length - 1)
-      |> remove_line_ending()
-    else
-      value
-    end
-  end
 end

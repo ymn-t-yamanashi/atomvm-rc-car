@@ -2,9 +2,10 @@ defmodule RcCarAtomvm.WsClient do
   @moduledoc """
   Minimal WebSocket client for the device-to-Elixir server connection.
 
-  The first network version intentionally uses plain `ws://` on a trusted LAN.
-  TLS termination for the public XRift connection belongs at the server or
-  reverse proxy layer.
+  The client supports plain `ws://` for a trusted LAN and `wss://` for a
+  Cloud Run endpoint.  The initial TLS implementation uses `verify_none`
+  because certificate verification is not available in the current firmware
+  configuration.  Use this mode only for controlled experiments.
   """
 
   alias RcCarAtomvm.Config
@@ -17,11 +18,11 @@ defmodule RcCarAtomvm.WsClient do
   @spec run() :: no_return()
   def run do
     case connect() do
-      {:ok, socket, buffer} ->
+      {:ok, connection, buffer} ->
         IO.puts("WebSocket connected")
         MotorController.stop()
-        send_json(socket, %{type: "hello", role: "device", device_id: Config.device_id()})
-        loop(socket, buffer)
+        send_json(connection, %{type: "hello", role: "device", device_id: Config.device_id()})
+        loop(connection, buffer)
 
       {:error, reason} ->
         IO.puts("WebSocket connection failed: #{inspect(reason)}")
@@ -32,33 +33,62 @@ defmodule RcCarAtomvm.WsClient do
   end
 
   defp connect do
-    options = [:binary, active: false]
-
-    with {:ok, server_host} <- Config.server_host(),
-         {:ok, socket} <- :gen_tcp.connect(server_host, Config.server_port(), options),
-         {:ok, key} <- handshake(socket, server_host),
-         {:ok, headers, buffer} <- recv_headers(socket) do
+    with {:ok, endpoint} <- Config.server_endpoint(),
+         {:ok, connection} <- open_connection(endpoint),
+         {:ok, key} <- handshake(connection, endpoint),
+         {:ok, headers, buffer} <- recv_headers(connection) do
       expected = Base.encode64(:crypto.hash(:sha, key <> @accept_magic))
 
       if :binary.match(headers, expected) != :nomatch and
            :binary.match(headers, "HTTP/1.1 101") != :nomatch do
-        {:ok, socket, buffer}
+        {:ok, connection, buffer}
       else
-        :gen_tcp.close(socket)
+        close_connection(connection)
         {:error, :invalid_websocket_accept}
       end
     end
   end
 
-  defp handshake(socket, server_host) do
+  defp open_connection(%{scheme: :ws, host: host, port: port}) do
+    options = [:binary, active: false]
+
+    case :gen_tcp.connect(:erlang.binary_to_list(host), port, options) do
+      {:ok, socket} -> {:ok, %{socket: socket, transport: :gen_tcp}}
+      error -> error
+    end
+  end
+
+  defp open_connection(%{scheme: :wss, host: host, port: port}) do
+    options = [
+      :binary,
+      active: false,
+      verify: :verify_none,
+      server_name_indication: :erlang.binary_to_list(host)
+    ]
+
+    with :ok <- start_ssl(),
+         {:ok, socket} <- :ssl.connect(:erlang.binary_to_list(host), port, options) do
+      {:ok, %{socket: socket, transport: :ssl}}
+    end
+  end
+
+  defp start_ssl do
+    case :ssl.start() do
+      :ok -> :ok
+      {:error, {:already_started, :ssl}} -> :ok
+      error -> error
+    end
+  end
+
+  defp handshake(connection, endpoint) do
     key = Base.encode64(:crypto.strong_rand_bytes(16))
 
     request = [
       "GET ",
-      Config.server_path(),
+      endpoint.path,
       " HTTP/1.1\r\n",
       "Host: ",
-      host_header(server_host),
+      host_header(endpoint),
       "\r\n",
       "Upgrade: websocket\r\n",
       "Connection: Upgrade\r\n",
@@ -68,19 +98,19 @@ defmodule RcCarAtomvm.WsClient do
       "Sec-WebSocket-Version: 13\r\n\r\n"
     ]
 
-    case :gen_tcp.send(socket, request) do
+    case send_data(connection, request) do
       :ok -> {:ok, key}
       error -> error
     end
   end
 
-  defp recv_headers(socket), do: recv_headers(socket, <<>>)
+  defp recv_headers(connection), do: recv_headers(connection, <<>>)
 
-  defp recv_headers(socket, buffer) do
+  defp recv_headers(connection, buffer) do
     case :binary.match(buffer, "\r\n\r\n") do
       :nomatch ->
-        case :gen_tcp.recv(socket, 0, 5_000) do
-          {:ok, chunk} -> recv_headers(socket, <<buffer::binary, chunk::binary>>)
+        case recv_data(connection, 0, 5_000) do
+          {:ok, chunk} -> recv_headers(connection, <<buffer::binary, chunk::binary>>)
           error -> error
         end
 
@@ -91,40 +121,40 @@ defmodule RcCarAtomvm.WsClient do
     end
   end
 
-  defp loop(socket, buffer) do
+  defp loop(connection, buffer) do
     case WebSocketFrame.decode(buffer) do
       :more ->
-        case :gen_tcp.recv(socket, 0, @recv_timeout) do
+        case recv_data(connection, 0, @recv_timeout) do
           {:ok, chunk} ->
-            loop(socket, <<buffer::binary, chunk::binary>>)
+            loop(connection, <<buffer::binary, chunk::binary>>)
 
           {:error, :timeout} ->
-            loop(socket, buffer)
+            loop(connection, buffer)
 
           {:error, reason} ->
-            close(socket, reason)
+            close(connection, reason)
         end
 
       {:error, reason} ->
-        close(socket, reason)
+        close(connection, reason)
 
       {:ok, frame, rest} ->
-        case handle_frame(socket, frame) do
+        case handle_frame(connection, frame) do
           :continue ->
-            loop(socket, rest)
+            loop(connection, rest)
 
           :close ->
-            close(socket, :server_closed)
+            close(connection, :server_closed)
         end
     end
   end
 
-  defp handle_frame(socket, %{opcode: 1, payload: payload}) do
+  defp handle_frame(connection, %{opcode: 1, payload: payload}) do
     case decode_json(payload) do
       {:ok, %{"type" => "motor_set", "left" => left, "right" => right}}
       when left in -1..1 and right in -1..1 ->
         :ok = MotorController.set(left, right)
-        send_json(socket, %{type: "motor_state", left: left, right: right})
+        send_json(connection, %{type: "motor_state", left: left, right: right})
         :continue
 
       {:ok, %{"type" => "server_ready"}} ->
@@ -134,23 +164,22 @@ defmodule RcCarAtomvm.WsClient do
         :continue
 
       _ ->
-        send_json(socket, %{type: "error", code: "invalid_message"})
+        send_json(connection, %{type: "error", code: "invalid_message"})
         :continue
     end
   end
 
-  defp handle_frame(socket, %{opcode: 9, payload: payload}) do
-    :gen_tcp.send(socket, WebSocketFrame.encode_pong(payload))
+  defp handle_frame(connection, %{opcode: 9, payload: payload}) do
+    :ok = send_data(connection, WebSocketFrame.encode_pong(payload))
     :continue
   end
 
-  defp handle_frame(_socket, %{opcode: 8}), do: :close
+  defp handle_frame(_connection, %{opcode: 8}), do: :close
+  defp handle_frame(_connection, _frame), do: :continue
 
-  defp handle_frame(_socket, _frame), do: :continue
-
-  defp send_json(socket, message) do
+  defp send_json(connection, message) do
     payload = :json.encode(message)
-    :gen_tcp.send(socket, WebSocketFrame.encode_text(IO.iodata_to_binary(payload)))
+    send_data(connection, WebSocketFrame.encode_text(IO.iodata_to_binary(payload)))
   end
 
   defp decode_json(payload) do
@@ -159,15 +188,32 @@ defmodule RcCarAtomvm.WsClient do
     :error, _ -> {:error, :invalid_json}
   end
 
-  defp host_header(server_host) do
-    server_host
-    |> :inet.ntoa()
-    |> List.to_string()
+  defp host_header(%{host: host, port: port, scheme: scheme}) do
+    if port == default_port(scheme) do
+      host
+    else
+      <<host::binary, ":", :erlang.integer_to_binary(port)::binary>>
+    end
   end
 
-  defp close(socket, reason) do
+  defp default_port(:ws), do: 80
+  defp default_port(:wss), do: 443
+
+  defp send_data(%{transport: :gen_tcp, socket: socket}, data), do: :gen_tcp.send(socket, data)
+  defp send_data(%{transport: :ssl, socket: socket}, data), do: :ssl.send(socket, data)
+
+  defp recv_data(%{transport: :gen_tcp, socket: socket}, length, timeout),
+    do: :gen_tcp.recv(socket, length, timeout)
+
+  defp recv_data(%{transport: :ssl, socket: socket}, length, _timeout),
+    do: :ssl.recv(socket, length)
+
+  defp close_connection(%{transport: :gen_tcp, socket: socket}), do: :gen_tcp.close(socket)
+  defp close_connection(%{transport: :ssl, socket: socket}), do: :ssl.close(socket)
+
+  defp close(connection, reason) do
     IO.puts("WebSocket closed: #{inspect(reason)}")
-    :gen_tcp.close(socket)
+    close_connection(connection)
     MotorController.stop()
     Process.sleep(3_000)
     run()
